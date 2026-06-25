@@ -12,12 +12,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	mp4 "github.com/Eyevinn/mp4ff/mp4"
 	widevine "github.com/iyear/gowidevine"
 	"github.com/iyear/gowidevine/widevinepb"
 	"google.golang.org/protobuf/proto"
@@ -31,26 +34,40 @@ var (
 	appToken  = os.Getenv("APPLE_MUSIC_APP_TOKEN")
 	userToken = os.Getenv("APPLE_MUSIC_USER_TOKEN")
 
-	// In-memory cache of decrypted tracks (trackID → decrypted MP4 bytes)
-	trackCache   = map[string][]byte{}
-	trackCacheMu sync.Mutex
+	// File-based cache. Decrypted tracks stored as .mp4 files. Survives restarts,
+	// uses negligible memory. Capped at startup, grows without bound during
+	// a session (100 tracks ≈ 600 MB max, harmless).
+	cacheDir string // set from -cache-dir flag
+
+	// CDM is not thread-safe (c.rand races under concurrent use).
+	cdmMu sync.Mutex
 )
 
 const (
-	webPlaybackURL = "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback"
+	webPlaybackURL  = "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback"
+	maxCacheEntries = 100 // max cached .mp4 files (~6 MB each → ~600 MB peak)
 )
 
 // Widevine System ID
 var widevineSystemID, _ = hex.DecodeString(widevine.WidevineSystemID)
+
+func cachePath(trackID string) string {
+	return filepath.Join(cacheDir, trackID+".mp4")
+}
 
 // =============================================================================
 // Main
 // =============================================================================
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	port := flag.Int("port", 8899, "HTTP listen port")
 	wvdPath := flag.String("wvd", "oneplus_pjx110_18.0.0@341310000_9b731721_28613_l3.wvd", "path to .wvd device file")
+	cacheFlag := flag.String("cache-dir",
+		filepath.Join(os.TempDir(), "apple-music-proxy-cache"),
+		"cache directory for decrypted tracks (cleared on startup)")
 	flag.Parse()
+	cacheDir = *cacheFlag
 
 	if appToken == "" {
 		log.Fatal("APPLE_MUSIC_APP_TOKEN is required")
@@ -58,6 +75,31 @@ func main() {
 	if userToken == "" {
 		log.Fatal("APPLE_MUSIC_USER_TOKEN is required")
 	}
+
+	// Init cache directory (reuse files from previous runs, trim to cap)
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		log.Fatalf("create cache dir: %v", err)
+	}
+	entries, _ := os.ReadDir(cacheDir)
+	type cf struct {
+		name    string
+		modTime int64
+	}
+	var files []cf
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".mp4") {
+			fi, err := e.Info()
+			if err != nil {
+				continue
+			}
+			files = append(files, cf{name: e.Name(), modTime: fi.ModTime().UnixNano()})
+		}
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime < files[j].modTime })
+	for i := 0; i < len(files)-maxCacheEntries; i++ {
+		os.Remove(filepath.Join(cacheDir, files[i].name))
+	}
+	log.Printf("Cache dir: %s (%d files, max %d)", cacheDir, min(len(files), maxCacheEntries), maxCacheEntries)
 
 	// Load Widevine L3 device once at startup.
 	device, err := loadWidevineDevice(*wvdPath)
@@ -89,15 +131,13 @@ func makePlayHandler(cdm *widevine.CDM) http.HandlerFunc {
 			return
 		}
 
-		// 1. webPlayback → song metadata
-		song, err := fetchSongMetadata(trackID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("webPlayback: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		// 2. Library track → redirect to direct asset URL
+		// 1. Library track → always need webPlayback for redirect URL.
 		if isLibraryID(trackID) {
+			song, err := fetchSongMetadata(trackID)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("webPlayback: %v", err), http.StatusBadGateway)
+				return
+			}
 			for _, a := range song.Assets {
 				if a.URL != "" {
 					log.Printf("[library] %s → 307", trackID)
@@ -109,17 +149,20 @@ func makePlayHandler(cdm *widevine.CDM) http.HandlerFunc {
 			return
 		}
 
-		// Check cache first (mpv retries, so second request should be instant).
-		trackCacheMu.Lock()
-		cached, hasCached := trackCache[trackID]
-		trackCacheMu.Unlock()
-		if hasCached {
-			log.Printf("[catalog] %s serving from cache (%d bytes)", trackID, len(cached))
-			serveData(w, r, cached)
+		// 2. Catalog track → check file cache BEFORE hitting Apple.
+		if cachedPath := cachePath(trackID); fileExists(cachedPath) {
+			http.ServeFile(w, r, cachedPath)
 			return
 		}
 
-		// 3. Catalog track → find ctrp256 m3u8
+		// 3. Cache miss → webPlayback to get m3u8 URL.
+		song, err := fetchSongMetadata(trackID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("webPlayback: %v", err), http.StatusBadGateway)
+			return
+		}
+
+		// 4. Catalog track → find ctrp256 m3u8
 		m3u8URL, licenseURL, skdURI, keyID := extractM3U8Info(song)
 		if m3u8URL == "" {
 			http.Error(w, "no ctrp256 asset found", http.StatusNotFound)
@@ -129,7 +172,7 @@ func makePlayHandler(cdm *widevine.CDM) http.HandlerFunc {
 		log.Printf("[catalog] %s m3u8=%s", trackID, m3u8URL[:min(len(m3u8URL), 80)])
 		log.Printf("[catalog] %s skd=%s keyID=%x", trackID, skdURI[:min(len(skdURI), 80)], keyID)
 
-		// 4. Widevine license → content key (hex)
+		// 5. Widevine license → content key (hex)
 		keyHex, err := getWidevineKey(cdm, keyID, licenseURL, skdURI, trackID)
 		if err != nil {
 			log.Printf("[catalog] %s Widevine FAILED: %v", trackID, err)
@@ -138,7 +181,7 @@ func makePlayHandler(cdm *widevine.CDM) http.HandlerFunc {
 		}
 		log.Printf("[catalog] %s → key obtained (%d hex chars)", trackID, len(keyHex))
 
-		// 5. Download segments, decrypt with gowidevine, stream to mpv.
+		// 6. Download & decrypt segments, stream to mpv.
 		streamTrack(w, r, m3u8URL, keyHex, trackID)
 	}
 }
@@ -339,11 +382,13 @@ func getWidevineKey(cdm *widevine.CDM, keyID []byte, licenseURL, skdURI, trackID
 		return "", fmt.Errorf("parse PSSH: %w", err)
 	}
 
+	cdmMu.Lock()
 	challenge, parseLicense, err := cdm.GetLicenseChallenge(
 		pssh,
 		widevinepb.LicenseType_STREAMING,
 		false, // privacyMode=false
 	)
+	cdmMu.Unlock()
 	if err != nil {
 		return "", fmt.Errorf("license challenge: %w", err)
 	}
@@ -354,7 +399,9 @@ func getWidevineKey(cdm *widevine.CDM, keyID []byte, licenseURL, skdURI, trackID
 		return "", fmt.Errorf("request license: %w", err)
 	}
 
+	cdmMu.Lock()
 	keys, err := parseLicense(license)
+	cdmMu.Unlock()
 	if err != nil {
 		return "", fmt.Errorf("parse license: %w", err)
 	}
@@ -411,10 +458,17 @@ func requestAppleLicense(licenseURL, skdURI string, challenge []byte, trackID st
 }
 
 // =============================================================================
-// FFmpeg streaming
+// Per-segment HLS streaming (download → decrypt → flush, one segment at a time)
 // =============================================================================
 
+type hlsSegment struct {
+	uri       string
+	byteRange string // e.g. "369773@1247" or "" for full file
+	isInit    bool
+}
+
 func streamTrack(w http.ResponseWriter, r *http.Request, m3u8URL, keyHex, trackID string) {
+	t0 := time.Now()
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("[catalog] %s PANIC: %v", trackID, rec)
@@ -427,38 +481,103 @@ func streamTrack(w http.ResponseWriter, r *http.Request, m3u8URL, keyHex, trackI
 		return
 	}
 
-	log.Printf("[catalog] %s downloading & decrypting segments...", trackID)
-
-	encrypted, err := downloadSegments(m3u8URL)
+	// 1. Parse HLS playlist
+	base := m3u8URL[:strings.LastIndexByte(m3u8URL, '/')+1]
+	segs, err := parseHLSSegments(m3u8URL, base)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("download segments: %v", err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("parse HLS: %v", err), http.StatusBadGateway)
+		return
+	}
+	if len(segs) == 0 || !segs[0].isInit {
+		http.Error(w, "no init segment in HLS playlist", http.StatusBadGateway)
 		return
 	}
 
-	key := &widevine.Key{
-		ID:   nil,
-		Key:  keyBytes,
-		Type: widevinepb.License_KeyContainer_CONTENT,
+	// 2. Download & parse init segment to extract decrypt info
+	initBytes, err := downloadSegmentBytes(segs[0])
+	if err != nil {
+		http.Error(w, fmt.Sprintf("download init: %v", err), http.StatusBadGateway)
+		return
 	}
-	var decrypted bytes.Buffer
-	if err := widevine.DecryptMP4Auto(bytes.NewReader(encrypted), []*widevine.Key{key}, &decrypted); err != nil {
-		http.Error(w, fmt.Sprintf("decrypt MP4: %v", err), http.StatusInternalServerError)
+	initFile, err := mp4.DecodeFile(bytes.NewReader(initBytes))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("parse init: %v", err), http.StatusInternalServerError)
+		return
+	}
+	decryptInfo, err := mp4.DecryptInit(initFile.Init)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("decrypt init: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[catalog] %s decrypted %d → %d bytes", trackID, len(encrypted), decrypted.Len())
+	log.Printf("[catalog] %s streaming %d segments (%d media)...", trackID, len(segs), len(segs)-1)
 
-	// Cache for future requests
-	trackCacheMu.Lock()
-	trackCache[trackID] = decrypted.Bytes()
-	trackCacheMu.Unlock()
+	// 3. Set up chunked streaming response + temp file for cache
+	w.Header().Set("Content-Type", "audio/mp4")
+	w.Header().Set("Cache-Control", "no-cache")
 
-	serveData(w, r, decrypted.Bytes())
+	flusher, canFlush := w.(http.Flusher)
+
+	tmpFile, err := os.CreateTemp(cacheDir, "tmp-*.mp4")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("create temp file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // clean up if we don't commit to cache
+
+	writer := io.MultiWriter(w, tmpFile)
+
+	// 4. Write decrypted init segment first
+	if err := initFile.Init.Encode(writer); err != nil {
+		log.Printf("[catalog] %s write init: %v", trackID, err)
+		return
+	}
+	if canFlush {
+		flusher.Flush()
+	}
+
+	// 5. Download, decrypt, and stream each media segment
+	for i := 1; i < len(segs); i++ {
+		segBytes, err := downloadSegmentBytes(segs[i])
+		if err != nil {
+			log.Printf("[catalog] %s segment %d download: %v", trackID, i, err)
+			return
+		}
+		segFile, err := mp4.DecodeFile(bytes.NewReader(segBytes))
+		if err != nil {
+			log.Printf("[catalog] %s segment %d parse: %v", trackID, i, err)
+			return
+		}
+		for _, seg := range segFile.Segments {
+			if err := mp4.DecryptSegment(seg, decryptInfo, keyBytes); err != nil {
+				if err.Error() == "no senc box in traf" {
+					continue // unencrypted segment
+				}
+				log.Printf("[catalog] %s segment %d decrypt: %v", trackID, i, err)
+				return
+			}
+			if err := seg.Encode(writer); err != nil {
+				log.Printf("[catalog] %s segment %d encode: %v", trackID, i, err)
+				return
+			}
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	tmpFile.Close()
+	fi, _ := os.Stat(tmpPath)
+
+	log.Printf("[catalog] %s streaming complete (%d bytes, total %s)", trackID, fi.Size(), time.Since(t0).Round(time.Millisecond))
+
+	// Commit to file cache. If another request already cached this track,
+	// the rename fails silently (our temp file gets cleaned up by defer).
+	os.Rename(tmpPath, cachePath(trackID))
 }
 
-func downloadSegments(m3u8URL string) ([]byte, error) {
-	base := m3u8URL[:strings.LastIndexByte(m3u8URL, '/')+1]
-
+func parseHLSSegments(m3u8URL, base string) ([]hlsSegment, error) {
 	resp, err := http.Get(m3u8URL)
 	if err != nil {
 		return nil, fmt.Errorf("download m3u8: %w", err)
@@ -466,11 +585,7 @@ func downloadSegments(m3u8URL string) ([]byte, error) {
 	defer resp.Body.Close()
 	playlist, _ := io.ReadAll(resp.Body)
 
-	type seg struct {
-		uri       string
-		byteRange string // e.g. "369773@1247" or "" for full file
-	}
-	var segs []seg
+	var segs []hlsSegment
 
 	// Init segment from #EXT-X-MAP
 	mapRe := regexp.MustCompile(`#EXT-X-MAP:URI="([^"]+)"(?:,BYTERANGE="([^"]+)")?`)
@@ -483,7 +598,7 @@ func downloadSegments(m3u8URL string) ([]byte, error) {
 		if !strings.HasPrefix(uri, "http") {
 			uri = base + uri
 		}
-		segs = append(segs, seg{uri: uri, byteRange: br})
+		segs = append(segs, hlsSegment{uri: uri, byteRange: br, isInit: true})
 	}
 
 	// Media segments: BYTERANGE on the EXT-X-BYTERANGE line, URI on the next line
@@ -507,36 +622,33 @@ func downloadSegments(m3u8URL string) ([]byte, error) {
 		if !strings.HasPrefix(uri, "http") {
 			uri = base + uri
 		}
-		segs = append(segs, seg{uri: uri, byteRange: currentBR})
+		segs = append(segs, hlsSegment{uri: uri, byteRange: currentBR})
 		currentBR = ""
 	}
 
-	log.Printf("downloading %d HLS segments...", len(segs))
-	var buf bytes.Buffer
-	for _, s := range segs {
-		req, _ := http.NewRequest("GET", s.uri, nil)
-		if s.byteRange != "" {
-			// HLS BYTERANGE format: "length@offset" → HTTP Range: "bytes=offset-(offset+length-1)"
-			parts := strings.SplitN(s.byteRange, "@", 2)
-			if len(parts) == 2 {
-				length, _ := strconv.Atoi(parts[0])
-				offset, _ := strconv.Atoi(parts[1])
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-			}
+	return segs, nil
+}
+
+func downloadSegmentBytes(seg hlsSegment) ([]byte, error) {
+	req, _ := http.NewRequest("GET", seg.uri, nil)
+	if seg.byteRange != "" {
+		parts := strings.SplitN(seg.byteRange, "@", 2)
+		if len(parts) == 2 {
+			length, _ := strconv.Atoi(parts[0])
+			offset, _ := strconv.Atoi(parts[1])
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 		}
-		client := &http.Client{Timeout: 15 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("download segment %s: %w", s.uri, err)
-		}
-		if resp.StatusCode >= 400 {
-			resp.Body.Close()
-			return nil, fmt.Errorf("download segment %s: HTTP %d", s.uri, resp.StatusCode)
-		}
-		io.Copy(&buf, resp.Body)
-		resp.Body.Close()
 	}
-	return buf.Bytes(), nil
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", seg.uri, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }
 
 // =============================================================================
@@ -547,33 +659,7 @@ func isLibraryID(id string) bool {
 	return regexp.MustCompile(`^[ailp]\.[a-zA-Z0-9]+$`).MatchString(id)
 }
 
-// serveData writes data with proper Range support for mpv seeking.
-func serveData(w http.ResponseWriter, r *http.Request, data []byte) {
-	w.Header().Set("Content-Type", "audio/mp4")
-	w.Header().Set("Accept-Ranges", "bytes")
-
-	rangeHdr := r.Header.Get("Range")
-	if strings.HasPrefix(rangeHdr, "bytes=") {
-		rangeVal := strings.TrimPrefix(rangeHdr, "bytes=")
-		parts := strings.SplitN(rangeVal, "-", 2)
-		var start, end int64
-		start, _ = strconv.ParseInt(parts[0], 10, 64)
-		if len(parts) > 1 && parts[1] != "" {
-			end, _ = strconv.ParseInt(parts[1], 10, 64)
-		} else {
-			end = int64(len(data)) - 1
-		}
-		if start < 0 || end >= int64(len(data)) || start > end {
-			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
-		w.WriteHeader(http.StatusPartialContent)
-		w.Write(data[start : end+1])
-		return
-	}
-
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-	w.Write(data)
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

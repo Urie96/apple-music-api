@@ -29,6 +29,7 @@ type Credential struct {
 
 type Config struct {
 	Port            int
+	ConfigDir       string
 	WVDPath         string
 	CacheDir        string
 	MaxCacheEntries int
@@ -44,24 +45,40 @@ func defaultConfigDir() string {
 	return filepath.Join(os.TempDir(), "apple-music-api")
 }
 
-func defaultCredentialPath() string {
-	return filepath.Join(defaultConfigDir(), "credentials.json")
+func defaultCredentialPath(configDir string) string {
+	return filepath.Join(configDir, "credentials.json")
 }
 
-func defaultWVDPath() string {
-	return filepath.Join(defaultConfigDir(), "device.wvd")
+func defaultWVDPath(configDir string) string {
+	return filepath.Join(configDir, "device.wvd")
 }
 
 func Load() (Config, error) {
 	var cfg Config
 	appTokenFlag := flag.String("app-token", "", "Apple Music app/developer token (overrides credential store)")
 	userTokenFlag := flag.String("user-token", "", "Apple Music user token (overrides credential store)")
+	configDirFlag := flag.String("config-dir", "", "base directory for config files (default "+defaultConfigDir()+")")
+	wvdFlag := flag.String("wvd", "", "path to .wvd device file (default <config-dir>/device.wvd)")
+	credentialPathFlag := flag.String("credential-store", "", "path to credential store JSON file (default <config-dir>/credentials.json)")
 	flag.IntVar(&cfg.Port, "port", 8899, "HTTP listen port")
-	flag.StringVar(&cfg.WVDPath, "wvd", defaultWVDPath(), "path to .wvd device file")
 	flag.StringVar(&cfg.CacheDir, "cache-dir", filepath.Join(os.TempDir(), "apple-music-api-cache"), "cache directory for decrypted tracks")
 	flag.IntVar(&cfg.MaxCacheEntries, "max-cache-entries", 100, "maximum decrypted media cache entries")
-	flag.StringVar(&cfg.CredentialPath, "credential-store", defaultCredentialPath(), "path to credential store JSON file")
 	flag.Parse()
+
+	cfg.ConfigDir = strings.TrimSpace(*configDirFlag)
+	if cfg.ConfigDir == "" {
+		cfg.ConfigDir = defaultConfigDir()
+	}
+
+	cfg.WVDPath = strings.TrimSpace(*wvdFlag)
+	if cfg.WVDPath == "" {
+		cfg.WVDPath = defaultWVDPath(cfg.ConfigDir)
+	}
+
+	cfg.CredentialPath = strings.TrimSpace(*credentialPathFlag)
+	if cfg.CredentialPath == "" {
+		cfg.CredentialPath = defaultCredentialPath(cfg.ConfigDir)
+	}
 
 	cfg.Store = store.NewCredentialStore(cfg.CredentialPath)
 	stored, _ := cfg.Store.Load()

@@ -14,6 +14,9 @@ go build -o apple-music-api .
 
 # Or with custom options
 ./apple-music-api --port 8899 --credential-store ~/.config/apple-music-api/credentials.json
+
+# Relocate all default config files (credentials.json, device.wvd)
+./apple-music-api --config-dir /etc/apple-music-api
 ```
 
 The service starts on `http://127.0.0.1:8899`. Open it in a browser to authorize.
@@ -135,10 +138,11 @@ Returns a playable media stream (redirect or decrypted content). Uses local decr
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `8899` | HTTP listen port |
-| `--credential-store` | `~/.config/apple-music-api/credentials.json` | Path to credential JSON file |
+| `--config-dir` | `~/.config/apple-music-api` | Base directory for default config files |
+| `--credential-store` | `<config-dir>/credentials.json` | Path to credential JSON file |
 | `--app-token` | _empty_ | Apple Music developer token (overrides store) |
 | `--user-token` | _empty_ | Apple Music user token (overrides store) |
-| `--wvd` | `~/.config/apple-music-api/device.wvd` | Path to Widevine `.wvd` device file |
+| `--wvd` | `<config-dir>/device.wvd` | Path to Widevine `.wvd` device file |
 | `--cache-dir` | OS temp dir | Cache directory for decrypted tracks |
 | `--max-cache-entries` | `100` | Maximum decrypted media cache entries |
 

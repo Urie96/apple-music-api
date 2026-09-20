@@ -1,4 +1,4 @@
-module temp
+module github.com/urie96/apple-music-api
 
 go 1.26.3
 

@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta name="referrer" content="strict-origin-when-cross-origin" />
+<title>Apple Music API Auth</title>
+<style>
+  :root { color-scheme: light only; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 680px; margin: 40px auto; padding: 20px; line-height: 1.5; background: #fff; color: #111827; }
+  h1 { margin-bottom: 8px; }
+  .subtitle { color: #6b7280; margin-top: 0; }
+  label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 14px; color: #374151; }
+  input, textarea { width: 100%; padding: 8px 12px; border: 2px solid #d1d5db; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; box-sizing: border-box; }
+  input:focus, textarea:focus { outline: none; border-color: #fa233b; box-shadow: 0 0 0 3px rgba(250,35,59,.12); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #status { padding: 12px; border-radius: 8px; margin: 16px 0; font-weight: 500; white-space: pre-wrap; }
+  .loading { background: #fef3c7; color: #92400e; }
+  .ready { background: #d1fae5; color: #065f46; }
+  .error { background: #fee2e2; color: #991b1b; }
+  .warn { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; padding: 12px; border-radius: 8px; margin: 16px 0; }
+  button { padding: 10px 24px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; background: #fa233b; color: white; font-weight: 600; }
+  button:hover { background: #d91e33; }
+  button:disabled { background: #9ca3af; cursor: not-allowed; }
+  #token-box { display: none; margin-top: 16px; }
+  #token-box textarea { height: 80px; resize: vertical; }
+  #token-box button { font-size: 14px; padding: 6px 16px; margin-top: 8px; }
+  .debug { font-size: 12px; color: #6b7280; margin-top: 20px; border-top: 1px solid #e5e7eb; padding-top: 10px; white-space: pre-wrap; }
+  .step { margin-bottom: 20px; }
+  .card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 18px; box-shadow: 0 6px 24px rgba(0,0,0,.05); }
+  .muted { color: #6b7280; font-size: 13px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<h1>🍎 Apple Music API Auth</h1>
+<p class="subtitle">Authorize Apple Music and save credentials to the local API service.</p>
+
+{{if .Warning}}<div class="warn"><b>Warning:</b> {{.Warning}}</div>{{end}}
+
+<div class="card">
+  <div class="step" id="step1">
+    <label for="app-token">Developer Token / MusicKit App Token</label>
+    <input id="app-token" type="text" value="{{.AppToken}}" placeholder="eyJhbGci..." autocomplete="off" />
+    <p class="muted">The service will save this app token together with the Apple Music user token.</p>
+    <button id="init-btn" onclick="initStep()" style="margin-top:8px">Initialize MusicKit</button>
+  </div>
+
+  <div class="step" id="step2" style="display:none">
+    <div id="status" class="loading"></div>
+    <button id="login-btn" onclick="doLogin()" disabled>Sign in to Apple Music</button>
+  </div>
+
+  <div id="token-box">
+    <p id="save-result">Token received.</p>
+    <textarea id="token-text" readonly onclick="this.select()"></textarea>
+    <div class="row">
+      <button onclick="copyToken()">📋 Copy user token</button>
+      <button onclick="location.reload()" style="background:#374151">Start over</button>
+      <span id="copy-msg" style="color:green;display:none">Copied!</span>
+    </div>
+  </div>
+</div>
+
+<div class="debug" id="debug"></div>
+
+<script>
+function log(msg) {
+  document.getElementById('debug').textContent += msg + '\n';
+  console.log(msg);
+}
+
+function setStatus(text, cls) {
+  var el = document.getElementById('status');
+  el.textContent = text;
+  el.className = cls;
+}
+
+document.addEventListener('musickitloaded', function () {
+  log('musickitloaded fired');
+  if (window._music && window._music.isAuthorized) {
+    finishInit(true);
+  }
+});
+
+function initStep() {
+  var appToken = document.getElementById('app-token').value.trim();
+  if (!appToken) { alert('Please paste a developer token'); return; }
+
+  document.getElementById('step1').style.display = 'none';
+  document.getElementById('step2').style.display = 'block';
+  setStatus('Loading MusicKit...', 'loading');
+  log('Initializing with token: ' + appToken.substring(0, 30) + '...');
+
+  if (typeof MusicKit !== 'undefined') {
+    log('MusicKit already loaded, re-configuring...');
+    finishInit(true);
+    return;
+  }
+
+  log('MusicKit not loaded yet; injecting script...');
+  var s = document.createElement('script');
+  s.src = 'https://js-cdn.music.apple.com/musickit/v3/musickit.js';
+  s.onerror = function () {
+    log('Failed to load MusicKit from CDN');
+    setStatus('Failed to load MusicKit. Check network / browser DevTools.', 'error');
+  };
+  document.body.appendChild(s);
+
+  var tries = 0;
+  var poll = setInterval(function () {
+    tries++;
+    if (typeof MusicKit !== 'undefined') {
+      clearInterval(poll);
+      log('MusicKit detected via polling (tries=' + tries + ')');
+      finishInit();
+    } else if (tries > 100) {
+      clearInterval(poll);
+      log('MusicKit poll timeout');
+      setStatus('MusicKit load timeout. Check network / browser DevTools.', 'error');
+    }
+  }, 200);
+}
+
+function finishInit(reconfig) {
+  log('finishInit, reconfig=' + !!reconfig);
+  MusicKit.configure({
+    developerToken: document.getElementById('app-token').value.trim(),
+    app: { name: 'Apple Music API Service', build: 'local' }
+  }).then(function () {
+    window._music = MusicKit.getInstance();
+    log('MusicKit configured; isAuthorized=' + window._music.isAuthorized);
+    if (window._music.isAuthorized) {
+      window._music.unauthorize();
+    }
+    setStatus('✅ Ready — click "Sign in to Apple Music"', 'ready');
+    document.getElementById('login-btn').disabled = false;
+  }).catch(function (err) {
+    log('configure error: ' + err);
+    setStatus('❌ ' + err, 'error');
+  });
+}
+
+function saveCredential(appToken, userToken) {
+  return fetch('/auth/apple/callback', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      app_token: appToken,
+      user_token: userToken,
+      user_token_updated_at: Math.floor(Date.now() / 1000)
+    })
+  }).then(function (resp) {
+    return resp.json().then(function (json) {
+      if (!resp.ok || json.error) {
+        throw new Error((json.error && json.error.message) || ('HTTP ' + resp.status));
+      }
+      return json;
+    });
+  });
+}
+
+function doLogin() {
+  var music = window._music;
+  var appToken = document.getElementById('app-token').value.trim();
+  if (!music) { alert('MusicKit not ready'); return; }
+
+  setStatus('Opening Apple login popup...', 'loading');
+  document.getElementById('login-btn').disabled = true;
+
+  music.authorize().then(function (token) {
+    log('Token obtained, length=' + token.length);
+    document.getElementById('token-text').value = token;
+    document.getElementById('token-box').style.display = 'block';
+    setStatus('Saving token to local service...', 'loading');
+    return saveCredential(appToken, token);
+  }).then(function (result) {
+    var applied = result.data && result.data.applied_to_runtime;
+    var store = result.data && result.data.credential_store;
+    document.getElementById('save-result').textContent = applied
+      ? '✅ Credentials saved and applied to this running service.'
+      : '✅ Credentials saved. Restart without env/flag overrides if you want the saved credentials to take effect.';
+    setStatus('✅ Authorization complete. Credential store: ' + (store || '-'), 'ready');
+  }).catch(function (err) {
+    log('authorize/save error: ' + err);
+    setStatus('❌ Login or save failed: ' + err, 'error');
+    document.getElementById('login-btn').disabled = false;
+  });
+}
+
+function copyToken() {
+  var ta = document.getElementById('token-text');
+  ta.select();
+  document.execCommand('copy');
+  var msg = document.getElementById('copy-msg');
+  msg.style.display = 'inline';
+  setTimeout(function () { msg.style.display = 'none'; }, 2000);
+}
+</script>
+</body>
+</html>

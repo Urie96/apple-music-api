@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta name="referrer" content="strict-origin-when-cross-origin" />
+{{if not .Authorized}}<meta http-equiv="refresh" content="0;url=/auth/apple" />{{end}}
+<title>Apple Music API</title>
+<style>
+  :root { color-scheme: light only; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 720px; margin: 40px auto; padding: 20px; line-height: 1.6; background: #fff; color: #111827; }
+  h1 { margin-bottom: 4px; }
+  .subtitle { color: #6b7280; margin-top: 0; }
+  a { color: #fa233b; }
+  .card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; margin-bottom: 20px; box-shadow: 0 6px 24px rgba(0,0,0,.05); background: #fff; }
+  .card h2 { margin-top: 0; font-size: 18px; color: #111827; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #e5e7eb; }
+  th { color: #6b7280; font-weight: 600; width: 160px; }
+  td { color: #111827; word-break: break-all; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+  .badge-ok { background: #d1fae5; color: #065f46; }
+  .badge-warn { background: #fef3c7; color: #92400e; }
+  .badge-muted { background: #f3f4f6; color: #6b7280; }
+  .error-msg { background: #fee2e2; color: #991b1b; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
+  .endpoints { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .endpoints code { background: #f3f4f6; color: #111827; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #111827; }
+  .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 13px; color: #6b7280; }
+  .warn-banner { background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+</style>
+</head>
+<body>
+
+{{if not .Authorized}}
+<h1>🔐 Not Authorized</h1>
+<p>Redirecting to <a href="/auth/apple">authorization page</a>…</p>
+{{else}}
+
+<h1>🍎 Apple Music API</h1>
+<p class="subtitle">Service running on <code>{{.Addr}}</code></p>
+
+{{if .Warning}}<div class="warn-banner"><b>⚠ Warning:</b> {{.Warning}}</div>{{end}}
+
+<div class="card">
+  <h2>🔑 Credentials</h2>
+  <table>
+    <tr><th>App Token</th><td>
+      {{if .AppTokenPreview}}<code>{{.AppTokenPreview}}</code>{{else}}<span class="badge badge-warn">not set</span>{{end}}
+      <span class="badge badge-muted">source: {{.AppTokenSource}}</span>
+    </td></tr>
+    <tr><th>User Token</th><td>
+      {{if .UserTokenPreview}}<code>{{.UserTokenPreview}}</code>{{else}}<span class="badge badge-warn">not set</span>{{end}}
+      <span class="badge badge-muted">source: {{.UserTokenSource}}</span>
+      {{if .UserTokenUpdatedAt}}<br><span class="badge badge-muted">updated: {{.UserTokenUpdatedAt}}</span>{{end}}
+    </td></tr>
+    <tr><th>Status</th><td><span class="badge badge-ok">✅ authorized</span></td></tr>
+    <tr><th>Credential Store</th><td><code>{{.CredentialPath}}</code></td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>🌍 Storefront</h2>
+  {{if .StorefrontError}}
+    <div class="error-msg">{{.StorefrontError}}</div>
+  {{else if .Storefront}}
+    <table>
+      <tr><th>Storefront ID</th><td><code>{{.Storefront}}</code></td></tr>
+      <tr><th>Status</th><td><span class="badge badge-ok">✅ connected</span></td></tr>
+    </table>
+  {{else}}
+    <p>Loading storefront…</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>📡 API Endpoints</h2>
+  <div class="endpoints">
+    <code>GET /health</code>
+    <code>GET /storefront</code>
+    <code>GET /search?term=…</code>
+    <code>GET /library/playlists</code>
+    <code>GET /library/albums</code>
+    <code>GET /library/artists</code>
+    <code>GET /library/tracks</code>
+    <code>GET /library/favorites/tracks</code>
+    <code>GET /catalog/artists/:id/albums</code>
+    <code>GET /recommendations</code>
+    <code>GET /stations/:id/tracks</code>
+    <code>GET /tracks/:id/play</code>
+    <code>PUT /ratings/tracks/:id</code>
+    <code>GET /auth/apple</code>
+  </div>
+</div>
+
+<div class="footer">
+  <a href="/auth/apple">Manage authorization →</a>
+</div>
+
+{{end}}
+</body>
+</html>
